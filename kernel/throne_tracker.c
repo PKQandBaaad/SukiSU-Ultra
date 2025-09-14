@@ -74,6 +74,7 @@ struct my_dir_context {
 	void *private_data;
 	int depth;
 	int *stop;
+	bool found_dynamic_manager;
 };
 // https://docs.kernel.org/filesystems/porting.html
 // filldir_t (readdir callbacks) calling conventions have changed. Instead of returning 0 or -E... it returns bool now. false means "no more" (as -E... used to) and true - "keep going" (as 0 in old calling conventions). Rationale: callers never looked at specific -E... values anyway. -> iterate_shared() instances require no changes at all, all filldir_t ones in the tree converted.
@@ -153,7 +154,7 @@ static void crown_manager(const char *apk, struct list_head *uid_data,
 			pr_info("Crowning manager: %s(uid=%d, signature_index=%d)\n",
 				pkg, np->uid, signature_index);
 
-			// Dynamic Sign index (1) or multi-manager signatures (2+)
+			// Dynamic Sign index (100) or multi-manager signatures (>= 2)
 			if (signature_index == DYNAMIC_SIGN_INDEX || signature_index >= 2) {
 				ksu_add_manager(np->uid, signature_index);
 
@@ -471,9 +472,10 @@ FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
 				dirpath, is_multi_manager, signature_index);
 			// Check for dynamic sign or multi-manager signatures
 			if (is_multi_manager &&
-			    (signature_index == DYNAMIC_SIGN_INDEX || signature_index >= 2)) {
+				 (signature_index == DYNAMIC_SIGN_INDEX || signature_index >= 2)) {
+				my_ctx->found_dynamic_manager = true;
 				crown_manager(dirpath, my_ctx->private_data,
-					      signature_index);
+					 signature_index);
 
 				struct apk_path_hash *apk_data =
 					kmalloc(sizeof(struct apk_path_hash),
@@ -488,13 +490,18 @@ FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
 
 			} else if (is_manager_apk(dirpath)) {
 				crown_manager(dirpath, my_ctx->private_data, 0);
-				*my_ctx->stop = 1;
+				
+				if (!my_ctx->found_dynamic_manager && !ksu_is_dynamic_manager_enabled()) {
+					*my_ctx->stop = 1;
+				}
 
 				// Manager found, clear APK cache list
-				list_for_each_entry_safe(
-					pos, n, &apk_path_hash_list, list) {
-					list_del(&pos->list);
-					kfree(pos);
+				if (!ksu_is_dynamic_manager_enabled()) {
+					list_for_each_entry_safe(
+						pos, n, &apk_path_hash_list, list) {
+						list_del(&pos->list);
+						kfree(pos);
+					}
 				}
 			} else {
 				struct apk_path_hash *apk_data =
@@ -520,6 +527,7 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
 	INIT_LIST_HEAD(&data_path_list);
 	INIT_LIST_HEAD(&apk_path_hash_list);
 	unsigned long data_app_magic = 0;
+	bool found_dynamic_manager = false;
 
 	// Initialize APK cache list
 	struct apk_path_hash *pos, *n;
@@ -543,8 +551,8 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
 				.parent_dir = pos->dirpath,
 				.private_data = uid_data,
 				.depth = pos->depth,
-				.stop = &stop
-			};
+				.stop = &stop,
+						.found_dynamic_manager = false };
 			struct file *file;
 
 			if (!stop) {
@@ -583,13 +591,17 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
 
 				iterate_dir(file, &ctx.ctx);
 				filp_close(file, NULL);
+				
+				if (ctx.found_dynamic_manager) {
+					found_dynamic_manager = true;
+				}
 			}
 skip_iterate:
 			list_del(&pos->list);
 			if (pos != &data)
 				kfree(pos);
-			}
 		}
+	}
 
 	// clear apk_path_hash_list unconditionally
 	pr_info("search manager: cleanup!\n");
@@ -646,13 +658,17 @@ static void track_throne_function(void)
 	}
 
 	// Check for dynamic managers
-	if (!dynamic_manager_exist && ksu_is_dynamic_manager_enabled()) {
-		list_for_each_entry(np, &uid_list, list) {
+	if (ksu_is_dynamic_manager_enabled()) {
+		dynamic_manager_exist = ksu_has_dynamic_managers();
+		
+		if (!dynamic_manager_exist) {
+			list_for_each_entry(np, &uid_list, list) {
 			// Check if this uid is a dynamic manager (not the traditional manager)
-			if (ksu_is_any_manager(np->uid) &&
+				if (ksu_is_any_manager(np->uid) &&
 				 np->uid != ksu_get_manager_uid()) {
-				dynamic_manager_exist = true;
-				break;
+					dynamic_manager_exist = true;
+					break;
+				}
 			}
 		}
 	}
@@ -661,16 +677,24 @@ static void track_throne_function(void)
 		if (ksu_is_manager_uid_valid()) {
 			pr_info("manager is uninstalled, invalidate it!\n");
 			ksu_invalidate_manager_uid();
-			goto prune;
 		}
 		pr_info("Searching manager...\n");
 		search_manager("/data/app", 2, &uid_list);
 		pr_info("Search manager finished\n");
-	} else if (!dynamic_manager_exist && ksu_is_dynamic_manager_enabled()) {
-		// Always perform search when called from dynamic manager rescan
+		goto prune;
+	}
+
+	// Always perform search when called from dynamic manager rescan
+	if (ksu_is_dynamic_manager_enabled() && !dynamic_manager_exist) {
 		pr_info("Dynamic sign enabled, Searching manager...\n");
 		search_manager("/data/app", 2, &uid_list);
 		pr_info("Search Dynamic sign manager finished\n");
+	}
+	// If traditional manager exists but no dynamic manager instances found, do a full search
+	if (manager_exist && ksu_is_dynamic_manager_enabled() && !dynamic_manager_exist) {
+		pr_info("Searching manager...\n");
+		search_manager("/data/app", 2, &uid_list);
+		pr_info("Search manager finished\n");
 	}
 
 prune:
