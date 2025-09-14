@@ -677,24 +677,16 @@ static void track_throne_function(void)
 		if (ksu_is_manager_uid_valid()) {
 			pr_info("manager is uninstalled, invalidate it!\n");
 			ksu_invalidate_manager_uid();
+			goto prune;
 		}
 		pr_info("Searching manager...\n");
 		search_manager("/data/app", 2, &uid_list);
 		pr_info("Search manager finished\n");
-		goto prune;
-	}
-
-	// Always perform search when called from dynamic manager rescan
-	if (ksu_is_dynamic_manager_enabled() && !dynamic_manager_exist) {
+		// Always perform search when called from dynamic manager rescan
+	} else if (!dynamic_manager_exist && ksu_is_dynamic_manager_enabled()) {
 		pr_info("Dynamic sign enabled, Searching manager...\n");
 		search_manager("/data/app", 2, &uid_list);
 		pr_info("Search Dynamic sign manager finished\n");
-	}
-	// If traditional manager exists but no dynamic manager instances found, do a full search
-	if (manager_exist && ksu_is_dynamic_manager_enabled() && !dynamic_manager_exist) {
-		pr_info("Searching manager...\n");
-		search_manager("/data/app", 2, &uid_list);
-		pr_info("Search manager finished\n");
 	}
 
 prune:
